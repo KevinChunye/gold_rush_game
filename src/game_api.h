@@ -1,93 +1,64 @@
-// game_api.h — C++ ABI for GoldRush 2.0 (编程掘金争夺赛)
-//
-// The structs below are copied field-for-field from the official rules
-// document. The engine dlopen()s our player.so and calls moveDecision()
-// once per round, so the memory layout of these structs MUST match the
-// official header exactly.
-//
-// NOTE: the official reference code sent to contestants also contains a
-// game_api.h. If that file ever differs from this one, replace this file
-// with the official one and rebuild.
+// game_api.h — GoldRush 2.0 选手接口 (C++)
+// 实现 moveDecision, 编译成 .so 提交。所有字段 4 字节对齐。
+#pragma once
 
-#ifndef GOLD_RUSH_GAME_API_H
-#define GOLD_RUSH_GAME_API_H
+constexpr int GRID_SIZE = 17;   // 地图 17x17
+constexpr int MAX_NPCS  = 7;    // 最多可见 NPC 数
+constexpr int S         = 6;    // 每回合总步数
+constexpr int REGION_COUNT = 5; // 快照区域数
 
-// ---- Contest parameters (public-beta values, see rules doc) ----
-#define GRID_N 17      // board is 17x17
-#define MAX_NPCS 7     // A: number of NPCs
-#define MAX_MOVES 6    // S: moves per round, shared by our two units
-#define NUM_REGIONS 5  // regions in the periodic global snapshot
-
-// grid[][] cell values
-#define CELL_FOG (-5)       // outside our vision
-#define CELL_BOMB (-3)      // bomb: entering costs 10% of held gold
-#define CELL_OBSTACLE (-1)  // impassable
-#define CELL_EMPTY 0        // walkable, no gold
-                            // >= 1 : walkable, value = gold on the cell
-
-// action codes for GameOutput.actions[]
-#define ACT_UP 0     // row - 1
-#define ACT_DOWN 1   // row + 1
-#define ACT_LEFT 2   // col - 1
-#define ACT_RIGHT 3  // col + 1
-#define ACT_STAY 4
-
+// 坐标(行, 列)
 struct Position {
     int row;
     int col;
 };
 
+// 可见 NPC
 struct NpcInfo {
-    int id;        // stable across rounds; 0 = empty slot
-    Position pos;  // (-1,-1) when not visible
+    int      id;   // NPC 编号, 跨回合不变; 空槽为 0
+    Position pos;  // 位置(row,col); 不可见时 (-1,-1)
 };
 
+// 快照中单个区域的统计
 struct RegionStat {
-    int id;              // region id 1-5
-    int enter;           // unit entries into the region during the window
-    int leave;           // unit exits from the region during the window
-    int gold_generated;  // gold spawned in the region during the window
-    int gold_collected;  // gold picked up in the region during the window
-    int gold_remaining;  // gold currently on the ground in the region
-    int occupants;       // units currently inside the region
+    int id;              // 区域编号 1-5
+    int enter;           // 窗口内进入该区域的角色次数
+    int leave;           // 窗口内离开该区域的角色次数
+    int gold_generated;  // 窗口内该区域生成的金币总量
+    int gold_collected;  // 窗口内该区域被拾取的金币总量
+    int gold_remaining;  // 该区域地面当前剩余金币
+    int occupants;       // 该区域当前角色数
 };
 
+// 每若干轮提供一次的全局区域快照
 struct Snapshot {
-    int window_begin;  // first round of the stat window; -1 if no snapshot
-    int window_end;    // last round of the stat window
-    RegionStat regions[NUM_REGIONS];
+    int        window_begin;         // 统计窗口起始轮; 无快照时为 -1
+    int        window_end;           // 统计窗口结束轮
+    RegionStat regions[REGION_COUNT];
 };
 
+// 决策输入
 struct GameInput {
-    int round;                        // current round, starts at 0
-    int grid[GRID_N][GRID_N];         // see CELL_* above
-    Position my_units[2];             // our unit 0 and unit 1
-    int my_units_gold[2];             // gold held by each of our units
-    int gold_opp;                     // opponent's two units' gold, summed
-    Position visible_enemies[2];      // (-1,-1) when not visible
-    int num_visible_npcs;             // valid entries in visible_npcs
-    NpcInfo visible_npcs[MAX_NPCS];   // visible NPCs
-    int snapshot_valid;               // 1 = fresh snapshot this round
-    Snapshot snapshot;                // global region stats, every D rounds
+    int      round;                  // 当前回合(从 0 开始)
+    int      grid[GRID_SIZE][GRID_SIZE];
+                                     // 带迷雾纯地形: -5雾 -3炸弹 -1障碍 0空地 >=1金币
+                                     // (角色不在网格中标记, 见下方 my_units / visible_enemies / visible_npcs)
+    Position my_units[2];            // 我方角色0、角色1 的位置(row,col)
+    int      my_units_gold[2];       // 我方角色0、角色1 各自持有金币
+    int      gold_opp;               // 对手两角色金币总和
+    Position visible_enemies[2];     // 视野内敌方角色位置, 从下标0紧凑排列; 空槽(-1,-1); 不告知是敌方哪个角色
+    int      num_visible_npcs;       // visible_npcs 中有效条数
+    NpcInfo  visible_npcs[MAX_NPCS]; // 可见 NPC 列表, 尾部用 id=0 / (-1,-1) 填充
+    int      snapshot_valid;         // 1=本轮有新快照; 0=无
+    Snapshot snapshot;               // 全局区域快照
 };
 
+// 决策输出
 struct GameOutput {
-    int actions[MAX_MOVES];  // each in [0,4], see ACT_*
-    int k;                   // unit 0 runs actions[0:k], unit 1 runs actions[k:6]
-    int order;               // 0 = unit 0 moves first, 1 = unit 1 first
-    int vp;                  // vision purchase: 0 none, 1 = 7x7 (2 gold), 2 = 9x9 (3 gold)
+    int actions[S];   // 6 步动作, 每个 ∈ [0,4]: 0=上 1=下 2=左 3=右 4=不动
+    int k;            // 分割点 [0,6]: 角色0走 actions[0..k-1], 角色1走 actions[k..5]
+    int order;        // 0=角色0先执行, 1=角色1先执行
+    int vp;           // 视野购买: 0=不买 1=买7x7 2=买9x9 (费用对局结束后结算)
 };
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// The one entry point the game engine calls. Must return within 300 ms
-// (overruns are billed to a 60 s per-match pool; empty pool = loss).
-GameOutput moveDecision(const GameInput* input);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif  // GOLD_RUSH_GAME_API_H
+extern "C" GameOutput moveDecision(const GameInput* input);

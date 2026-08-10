@@ -20,13 +20,13 @@
 
 #include <cstring>
 
-#include "game_api.h"
+#include "constants.h"
 
 namespace {
 
-constexpr int kCells = GRID_N * GRID_N;
-constexpr int kStepsPerUnit = MAX_MOVES / 2;  // 3 moves per unit
-constexpr int kCenter = GRID_N / 2;           // (8,8)
+constexpr int kCells = GRID_SIZE * GRID_SIZE;
+constexpr int kStepsPerUnit = S / 2;   // 3 moves per unit
+constexpr int kCenter = GRID_SIZE / 2; // (8,8)
 
 // row/col deltas indexed by ACT_UP, ACT_DOWN, ACT_LEFT, ACT_RIGHT
 constexpr int kDr[4] = {-1, 1, 0, 0};
@@ -38,14 +38,14 @@ constexpr int kDc[4] = {0, 0, -1, 1};
 // that to remember obstacles, which are fixed for a given map.
 // ---------------------------------------------------------------------------
 int g_last_round = -1;
-unsigned char g_known_obstacle[GRID_N][GRID_N];
+unsigned char g_known_obstacle[GRID_SIZE][GRID_SIZE];
 
 void ResetMatchState() {
     g_last_round = -1;
     std::memset(g_known_obstacle, 0, sizeof(g_known_obstacle));
 }
 
-bool InBounds(int r, int c) { return r >= 0 && r < GRID_N && c >= 0 && c < GRID_N; }
+bool InBounds(int r, int c) { return r >= 0 && r < GRID_SIZE && c >= 0 && c < GRID_SIZE; }
 
 int Abs(int x) { return x < 0 ? -x : x; }
 
@@ -54,7 +54,7 @@ int Abs(int x) { return x < 0 ? -x : x; }
 // Writes up to `steps` moves into `moves`, returns how many were written,
 // or -1 if no gold is reachable. `target_out` reports the chosen pile.
 int PlanTowardGold(const GameInput* in, Position start,
-                   const unsigned char blocked[GRID_N][GRID_N],
+                   const unsigned char blocked[GRID_SIZE][GRID_SIZE],
                    int avoid_target, int steps, int moves[],
                    int* target_out) {
     int dist[kCells];
@@ -64,14 +64,14 @@ int PlanTowardGold(const GameInput* in, Position start,
     std::memset(dist, -1, sizeof(dist));
 
     int head = 0, tail = 0;
-    const int start_idx = start.row * GRID_N + start.col;
+    const int start_idx = start.row * GRID_SIZE + start.col;
     dist[start_idx] = 0;
     queue[tail++] = start_idx;
 
     int target = -1;
     while (head < tail) {
         const int cur = queue[head++];
-        const int r = cur / GRID_N, c = cur % GRID_N;
+        const int r = cur / GRID_SIZE, c = cur % GRID_SIZE;
         if (cur != start_idx && in->grid[r][c] >= 1 && cur != avoid_target) {
             target = cur;  // BFS order => nearest pile
             break;
@@ -79,7 +79,7 @@ int PlanTowardGold(const GameInput* in, Position start,
         for (int d = 0; d < 4; ++d) {
             const int nr = r + kDr[d], nc = c + kDc[d];
             if (!InBounds(nr, nc) || blocked[nr][nc]) continue;
-            const int ni = nr * GRID_N + nc;
+            const int ni = nr * GRID_SIZE + nc;
             if (dist[ni] != -1) continue;
             dist[ni] = dist[cur] + 1;
             prev_cell[ni] = cur;
@@ -101,7 +101,7 @@ int PlanTowardGold(const GameInput* in, Position start,
 
 // Fallback when no gold is visible: greedy-walk toward the center, only
 // onto cells known to be safe, stopping early if boxed in.
-int PlanTowardCenter(const unsigned char blocked[GRID_N][GRID_N], Position start,
+int PlanTowardCenter(const unsigned char blocked[GRID_SIZE][GRID_SIZE], Position start,
                      int steps, int moves[]) {
     int r = start.row, c = start.col;
     int n = 0;
@@ -128,10 +128,10 @@ int PlanTowardCenter(const unsigned char blocked[GRID_N][GRID_N], Position start
 // Plan one unit: gold first, center fallback. Fills exactly `steps` slots
 // (padding with STAY) and returns the unit's final position.
 Position PlanUnit(const GameInput* in, Position start,
-                  const unsigned char blocked[GRID_N][GRID_N],
+                  const unsigned char blocked[GRID_SIZE][GRID_SIZE],
                   int avoid_target, int steps, int out_actions[],
                   int* target_out) {
-    int moves[MAX_MOVES];
+    int moves[S];
     int n = PlanTowardGold(in, start, blocked, avoid_target, steps, moves, target_out);
     if (n < 0 && avoid_target >= 0) {
         // Only one pile in sight: sharing it still beats idling
@@ -160,7 +160,7 @@ Position PlanUnit(const GameInput* in, Position start,
 extern "C" GameOutput moveDecision(const GameInput* input) {
     // Baseline output is always legal even if everything below bails out.
     GameOutput out = {};
-    for (int i = 0; i < MAX_MOVES; ++i) out.actions[i] = ACT_STAY;
+    for (int i = 0; i < S; ++i) out.actions[i] = ACT_STAY;
     out.k = kStepsPerUnit;  // unit 0: actions[0..2], unit 1: actions[3..5]
     out.order = 0;
     out.vp = 0;
@@ -172,12 +172,12 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
     g_last_round = input->round;
 
     // Remember every obstacle we have ever seen (they never move).
-    for (int r = 0; r < GRID_N; ++r)
-        for (int c = 0; c < GRID_N; ++c)
+    for (int r = 0; r < GRID_SIZE; ++r)
+        for (int c = 0; c < GRID_SIZE; ++c)
             if (input->grid[r][c] == CELL_OBSTACLE) g_known_obstacle[r][c] = 1;
 
     // Count NPCs per cell; >= 3 on one cell tramples us for 5% of our gold.
-    unsigned char npc_count[GRID_N][GRID_N];
+    unsigned char npc_count[GRID_SIZE][GRID_SIZE];
     std::memset(npc_count, 0, sizeof(npc_count));
     for (int i = 0; i < input->num_visible_npcs && i < MAX_NPCS; ++i) {
         const Position p = input->visible_npcs[i].pos;
@@ -187,9 +187,9 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
     // Cells we refuse to step on. Fog is treated as a wall: it could hide
     // an obstacle (wasted move) or a bomb (-10% gold), and our vision
     // recenters on us next round anyway.
-    unsigned char blocked[GRID_N][GRID_N];
-    for (int r = 0; r < GRID_N; ++r) {
-        for (int c = 0; c < GRID_N; ++c) {
+    unsigned char blocked[GRID_SIZE][GRID_SIZE];
+    for (int r = 0; r < GRID_SIZE; ++r) {
+        for (int c = 0; c < GRID_SIZE; ++c) {
             const int v = input->grid[r][c];
             blocked[r][c] = (v == CELL_FOG || v == CELL_BOMB || v == CELL_OBSTACLE ||
                              g_known_obstacle[r][c] || npc_count[r][c] >= 3)
@@ -204,7 +204,7 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
 
     // Unit 0 plans first (order = 0). While it moves, unit 1 is still parked
     // on its current cell, so that cell is a wall for unit 0...
-    unsigned char blocked0[GRID_N][GRID_N];
+    unsigned char blocked0[GRID_SIZE][GRID_SIZE];
     std::memcpy(blocked0, blocked, sizeof(blocked));
     blocked0[input->my_units[1].row][input->my_units[1].col] = 1;
     int target0 = -1;
@@ -212,7 +212,7 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
                                    kStepsPerUnit, &out.actions[0], &target0);
 
     // ...and by the time unit 1 moves, unit 0 sits on its final cell.
-    unsigned char blocked1[GRID_N][GRID_N];
+    unsigned char blocked1[GRID_SIZE][GRID_SIZE];
     std::memcpy(blocked1, blocked, sizeof(blocked));
     blocked1[end0.row][end0.col] = 1;
     int target1 = -1;

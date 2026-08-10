@@ -18,7 +18,7 @@
 #include <cstring>
 #include <vector>
 
-#include "../src/game_api.h"
+#include "../src/constants.h"
 
 using MoveFn = GameOutput (*)(const GameInput*);
 
@@ -39,8 +39,8 @@ static const int kDc[4] = {0, 0, -1, 1};
 static GameInput MakeEmptyInput() {
     GameInput in;
     std::memset(&in, 0, sizeof(in));
-    for (int r = 0; r < GRID_N; ++r)
-        for (int c = 0; c < GRID_N; ++c) in.grid[r][c] = CELL_FOG;
+    for (int r = 0; r < GRID_SIZE; ++r)
+        for (int c = 0; c < GRID_SIZE; ++c) in.grid[r][c] = CELL_FOG;
     in.visible_enemies[0] = {-1, -1};
     in.visible_enemies[1] = {-1, -1};
     for (int i = 0; i < MAX_NPCS; ++i) in.visible_npcs[i] = {0, {-1, -1}};
@@ -53,15 +53,15 @@ static void RevealVision(GameInput* in, int r, int c) {
     for (int dr = -2; dr <= 2; ++dr)
         for (int dc = -2; dc <= 2; ++dc) {
             const int nr = r + dr, nc = c + dc;
-            if (nr < 0 || nr >= GRID_N || nc < 0 || nc >= GRID_N) continue;
+            if (nr < 0 || nr >= GRID_SIZE || nc < 0 || nc >= GRID_SIZE) continue;
             if (in->grid[nr][nc] == CELL_FOG) in->grid[nr][nc] = CELL_EMPTY;
         }
 }
 
 static void PrintBoard(const GameInput& in) {
-    char board[GRID_N][GRID_N];
-    for (int r = 0; r < GRID_N; ++r)
-        for (int c = 0; c < GRID_N; ++c) {
+    char board[GRID_SIZE][GRID_SIZE];
+    for (int r = 0; r < GRID_SIZE; ++r)
+        for (int c = 0; c < GRID_SIZE; ++c) {
             const int v = in.grid[r][c];
             char ch = '?';
             if (v == CELL_FOG) ch = '~';
@@ -83,9 +83,9 @@ static void PrintBoard(const GameInput& in) {
     board[in.my_units[1].row][in.my_units[1].col] = 'B';
 
     std::printf("     (~ fog  # obstacle  X bomb  . empty  1-9 gold  A/B us  E enemy  n NPC)\n");
-    for (int r = 0; r < GRID_N; ++r) {
+    for (int r = 0; r < GRID_SIZE; ++r) {
         std::printf("     ");
-        for (int c = 0; c < GRID_N; ++c) std::printf("%c ", board[r][c]);
+        for (int c = 0; c < GRID_SIZE; ++c) std::printf("%c ", board[r][c]);
         std::printf("\n");
     }
 }
@@ -104,10 +104,10 @@ static const char* ActName(int a) {
 // Format check: an out-of-range field means instant match loss, so this is
 // the single most important property of the bot.
 static void ValidateFormat(const GameOutput& out) {
-    for (int i = 0; i < MAX_MOVES; ++i)
+    for (int i = 0; i < S; ++i)
         CHECK(out.actions[i] >= 0 && out.actions[i] <= 4, "actions[%d]=%d out of [0,4]", i,
               out.actions[i]);
-    CHECK(out.k >= 0 && out.k <= MAX_MOVES, "k=%d out of [0,%d]", out.k, MAX_MOVES);
+    CHECK(out.k >= 0 && out.k <= S, "k=%d out of [0,%d]", out.k, S);
     CHECK(out.order == 0 || out.order == 1, "order=%d not in {0,1}", out.order);
     CHECK(out.vp >= 0 && out.vp <= 2, "vp=%d not in {0,1,2}", out.vp);
 }
@@ -117,15 +117,15 @@ static void ValidateFormat(const GameOutput& out) {
 static void ValidateFirstSteps(const GameInput& in, const GameOutput& out) {
     for (int unit = 0; unit < 2; ++unit) {
         const int begin = unit == 0 ? 0 : out.k;
-        const int end = unit == 0 ? out.k : MAX_MOVES;
+        const int end = unit == 0 ? out.k : S;
         if (begin >= end) continue;  // unit got no moves this round
         const int a = out.actions[begin];
         if (a == ACT_STAY) continue;
         const int nr = in.my_units[unit].row + kDr[a];
         const int nc = in.my_units[unit].col + kDc[a];
-        CHECK(nr >= 0 && nr < GRID_N && nc >= 0 && nc < GRID_N,
+        CHECK(nr >= 0 && nr < GRID_SIZE && nc >= 0 && nc < GRID_SIZE,
               "unit %d first move leaves the board", unit);
-        if (nr < 0 || nr >= GRID_N || nc < 0 || nc >= GRID_N) continue;
+        if (nr < 0 || nr >= GRID_SIZE || nc < 0 || nc >= GRID_SIZE) continue;
         CHECK(in.grid[nr][nc] != CELL_OBSTACLE, "unit %d first move hits an obstacle", unit);
         CHECK(in.grid[nr][nc] != CELL_BOMB, "unit %d first move steps on a bomb", unit);
         int npcs = 0;
@@ -144,7 +144,7 @@ static GameOutput RunScenario(MoveFn move, const char* title, const GameInput& i
     std::printf("    unit A: ");
     for (int i = 0; i < out.k; ++i) std::printf("%s ", ActName(out.actions[i]));
     std::printf("\n    unit B: ");
-    for (int i = out.k; i < MAX_MOVES; ++i) std::printf("%s ", ActName(out.actions[i]));
+    for (int i = out.k; i < S; ++i) std::printf("%s ", ActName(out.actions[i]));
     std::printf("\n");
     ValidateFormat(out);
     ValidateFirstSteps(in, out);

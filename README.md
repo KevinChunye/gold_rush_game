@@ -67,12 +67,17 @@ no allocation, no I/O):
 ```
 ├── Makefile              make -> player.so (the upload artifact); make test
 ├── src/
-│   ├── game_api.h        contest ABI structs, transcribed from the rules
+│   ├── game_api.h        official contest ABI — byte-identical copy of
+│   │                     reference/game_api.h (keep it that way)
+│   ├── constants.h       cell values + action codes from the rules
 │   └── player.cpp        the bot — the only file strategy work touches
-└── test/
-    └── local_test.cpp    offline harness: dlopen()s player.so like the real
-                          engine, runs scripted scenarios, checks legality,
-                          measures p50/p90 latency
+├── test/
+│   └── local_test.cpp    offline harness: dlopen()s player.so like the real
+│                         engine, runs scripted scenarios, checks legality,
+│                         measures p50/p90 latency
+└── reference/            official 参考代码 from the organizers (game.zip):
+                          canonical game_api.h, a random-walk sample player
+                          (C++ and Python), their Makefile
 ```
 
 ## 4. Quick start
@@ -114,8 +119,10 @@ latency summary, and ends with `ALL CHECKS PASSED`.
       0=up/1=down/2=left/3=right and row/col orientation match the engine).
 - [ ] Units route around obstacles and bombs, and collect gold.
 - [ ] P90 latency on the leaderboard is microseconds-tiny.
-- [ ] If the official 参考代码 ships its own `game_api.h`, diff it against
-      `src/game_api.h` and adopt the official one if they differ at all.
+- [x] ABI verified: `src/game_api.h` **is** the official header from the
+      reference code, copied verbatim (`diff reference/game_api.h
+      src/game_api.h` must stay empty). The official sample player is a
+      random walker, so this bot already beats the provided baseline.
 
 ## 5. The interface in 30 seconds
 
@@ -127,8 +134,9 @@ extern "C" GameOutput moveDecision(const GameInput* input);
 
 - **In** (`GameInput`): `round`; `grid[17][17]` with `-5` fog / `-3` bomb /
   `-1` obstacle / `0` empty / `≥1` gold amount; our two unit positions and
-  gold; opponent's total gold; visible enemy positions; visible NPCs; and
-  every 5 rounds a region `snapshot`.
+  gold; opponent's total gold; visible enemy positions (packed from index 0,
+  empty slots `(-1,-1)` — and we are *not* told which enemy unit is which);
+  visible NPCs; and every 5 rounds a region `snapshot`.
 - **Out** (`GameOutput`): `actions[6]` (0=up 1=down 2=left 3=right 4=stay),
   `k` (unit 0 executes `actions[0:k]`, unit 1 executes `actions[k:6]`),
   `order` (which of our units moves first), `vp` (vision purchase).

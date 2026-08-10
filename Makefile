@@ -13,12 +13,15 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
 
 # -static-libstdc++/-static-libgcc: the engine dlopen()s our library into
 # its own process, so we avoid depending on whatever libstdc++ it ships.
+# (The official sample uses `-O2 -march=native -fPIC -shared`; -march=native
+# is fine when compiling on the contest server, whose CPU matches the judge
+# machines, but we skip it so the .so also runs when built elsewhere.)
 SOFLAGS = -shared -fPIC -static-libstdc++ -static-libgcc
 
-player.so: src/player.cpp src/game_api.h
+player.so: src/player.cpp src/game_api.h src/constants.h
 	$(CXX) $(CXXFLAGS) $(SOFLAGS) -o $@ src/player.cpp
 
-test_runner: test/local_test.cpp src/game_api.h
+test_runner: test/local_test.cpp src/game_api.h src/constants.h
 	$(CXX) $(CXXFLAGS) -o $@ test/local_test.cpp -ldl
 
 .PHONY: test clean
