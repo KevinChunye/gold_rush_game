@@ -40,27 +40,36 @@ So the game is essentially **exploration vs. exploitation under fog of war
 with a latency scoreboard**: find gold you cannot fully see, route two units
 efficiently around hazards, and answer quickly.
 
-## 2. What this MVP does
+## 2. What the bot does (v2 — "memory + value chains")
 
-Everything lives in [`src/player.cpp`](src/player.cpp) (~200 lines, no STL,
-no allocation, no I/O):
+Everything lives in [`src/player.cpp`](src/player.cpp) (~380 lines, no STL,
+no allocation, no I/O). The decision architecture is expected-value
+maximization over the 6 moves, not nearest-gold greed:
 
-1. **Fixed split**: each unit gets 3 of the 6 moves (`k=3`, `order=0`, no
-   vision purchase).
-2. **Gold seeking**: BFS over the *currently visible, safe* cells to the
-   nearest gold pile; the two units pick different piles when possible.
-3. **Fallback**: with no visible gold, walk toward the center (8,8), where
-   gold spawns every round.
-4. **Safety**: never steps into fog, obstacles, bombs, visible enemies,
-   cells with ≥ 3 NPCs, or our own other unit. Worst case it stands still —
-   which is always a legal answer.
-5. **Persistent memory**: the engine keeps `player.so` loaded for the whole
-   match, so globals survive between rounds. We use that to remember every
-   obstacle ever seen (the map is static), and we reset state when the round
-   counter restarts (= a new match began). This is the scaffold any future
-   strategy state (gold heatmaps, opponent tracking) will reuse.
-6. **Speed**: a decision costs ~1 µs (see `make test` output) against the
-   300 ms budget — no timeout risk, and a strong entry for the speed prize.
+1. **Belief memory across rounds** (the engine keeps the `.so` loaded):
+   obstacles are remembered forever (they never move), bombs stay feared
+   for ~one respawn window after sighting, and gold piles are remembered
+   with a belief that decays over ~40 rounds (someone may take them while
+   we're away). State auto-resets when a new match starts.
+2. **Fog is traversable, priced by wealth.** Crossing unknown cells risks
+   a hidden bomb (−10 % of held gold), so fog crossings are charged
+   against a target's value in proportion to the unit's gold: poor units
+   explore boldly, rich units stick to charted ground.
+3. **Value-aware chained targeting.** Each unit repeatedly takes the best
+   pickup-per-step option — a pile (65 % of believed value at BFS
+   distance) or re-entering the pile underfoot (2 moves for 65 % of the
+   remainder) — and keeps going until its move budget runs out; with
+   nothing in sight or memory it drifts toward the center spawn area.
+4. **Dynamic split & order.** Each round the 6 moves are divided by
+   maximizing the two units' combined value curves over every `k` in
+   [0,6]; both execution orders are evaluated; and the second mover
+   re-plans around the piles the first mover will already have taken
+   (65 % claim discount) and its final cell.
+5. **Safety unchanged from v1**: never steps into known obstacles, bombs,
+   enemies, or ≥ 3-NPC cells, and always returns a legal `GameOutput`
+   (worst case: stand still). No vision purchases yet (`vp=0`).
+6. **Speed**: a decision costs ~25 µs p90 (see `make test`) against the
+   300 ms budget — no timeout risk, and still a strong speed-prize entry.
 
 ## 3. Repo layout
 
@@ -146,21 +155,28 @@ extern "C" GameOutput moveDecision(const GameInput* input);
   the pre-move state, and only the final position's vision comes back next
   round (no en-route vision).
 
-## 6. Known limitations → roadmap
+## 6. Status → roadmap
 
-Deliberately out of scope for the MVP, in rough order of expected value:
+Done in v2: value/distance targeting, gold + bomb memory with decay,
+re-pickup chains, dynamic `k` + `order`, wealth-priced fog crossing.
 
-1. **Use the snapshot** — steer units toward regions with high
-   `gold_remaining` instead of blind center-walking.
-2. **Gold memory & heatmap** — remember seen-but-uncollected gold and spawn
-   statistics across rounds (the persistence scaffold already exists).
-3. **Dynamic move split** — vary `k` (e.g. 4/2 when one unit is in a rich
-   area) and pick `order` deliberately.
-4. **Vision purchases** — buy 7×7/9×9 when the expected information beats
-   the 2–3 gold price.
-5. **Re-pickup loops** — a cell keeps 35 % after pickup; oscillating on rich
-   piles is profitable.
-6. **Smarter fog handling** — currently fog is a wall; model it instead of
-   avoiding it (risk: hidden bombs cost 10 %).
-7. **Opponent/NPC modeling** — infer turn order from state diffs, avoid
-   contested piles we'd lose, race the ones we'd win.
+Next, in rough order of expected value:
+
+1. **Snapshot macro layer** — steer units toward regions with high
+   `gold_remaining` and low traffic, and de-correlate the two units
+   (one farms the center, one works an under-contested region). Needs
+   the region geometry, to be extracted from the official game logs.
+2. **Vision purchases as investment** — buy 7×7/9×9 when the end-of-round
+   position is information-rich (frontier cells, supposedly-rich region,
+   enough rounds left to amortize). The baseline bot shows the failure
+   mode: it bought vision every snapshot round and finished negative.
+3. **Opponent & NPC modeling** — we nearly always move first (µs
+   latency), so contested piles are worth more to us than raw distance
+   suggests: race the favorable contests, concede the lost ones; track
+   NPC headings via their stable ids.
+4. **Terminal-position value** — prefer plans that end next to spawn-rich
+   ground, not just plans that collect the most now.
+5. **Learned candidate scorer (second submission)** — mine the official
+   logs for spawn/NPC statistics, train a small model (boosted trees) to
+   score candidate move plans, and upload it under a separate model name
+   so it can be A/B-tested against this bot on the ladder.
