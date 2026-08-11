@@ -1,29 +1,37 @@
-// player.cpp — GoldRush 2.0 bot, v2 "memory + value chains".
+// player.cpp — GoldRush 2.0 bot, v2.1 "memory + value chains, disciplined".
 //
-// v1 proved the pipeline: always-legal output, microsecond decisions.
-// v2 keeps both guarantees and changes the decision architecture from
-// "nearest gold by BFS" to "expected-value maximization":
+// v2 lost its ladder A/B against v1 (431 vs 1195). Post-mortem pointed at
+// three causes, each fixed here:
 //
-//   1. Belief memory across rounds (the engine keeps this .so loaded):
-//      - obstacles: permanent (they never move),
-//      - bombs: feared for ~one respawn window after last sighting,
-//      - gold piles: remembered with a decaying belief (someone else
-//        may grab them while we are away).
-//   2. Fog is traversable, priced by wealth. A hidden obstacle only
-//      wastes a step (the engine skips illegal moves), but a hidden bomb
-//      costs 10% of held gold — so crossing fog charges a candidate
-//      target in proportion to the unit's gold. Poor units explore,
-//      rich units stay on charted ground.
-//   3. Value-aware chained targeting: each unit repeatedly takes the
-//      option with the best expected pickup-per-step — a reachable pile,
-//      or stepping off and back onto the pile it stands on (each entry
-//      pays 65% of what remains) — then continues with leftover moves.
-//   4. Dynamic split and order: the 6 moves go to whichever unit turns
-//      them into more value (k chosen over [0,6] from both units' value
-//      curves), both execution orders are tried, and the second mover
-//      re-plans around what the first will already have grabbed.
+//   A. Fog-blind pathing. v2 planned shortest paths through fog for free
+//      when the unit was poor. A hidden obstacle skips that step and every
+//      LATER step then executes from the wrong cell (the engine keeps
+//      trying the rest of the sequence), so one unseen wall could turn a
+//      whole round of moves into garbage — and hidden bombs taxed us too.
+//      Fix: every fog step now carries a base price (hidden obstacles
+//      waste moves even when we hold no gold) plus the wealth-scaled bomb
+//      price, and any emitted path is TRUNCATED at its first fog cell: a
+//      unit steps into at most one unknown cell per round, re-planning
+//      with fresh vision next round. No more cascading desync.
 //
-// Still no STL, no allocation, no I/O; a round costs a few microseconds.
+//   B. Phantom gold. v2 remembered piles for ~40 rounds everywhere. In
+//      the center 9x9 — where the opponent and 7 NPCs live — a pile seen
+//      5 rounds ago is almost certainly gone, and units marched to
+//      nothing. Fix: center memories decay ~30% per round; only outer
+//      piles (rarely visited by anyone) keep the slow decay.
+//
+//   C. Contested piles. Whoever answers faster moves first and takes 65%
+//      of any contested cell, and NPCs move before the slower player too.
+//      Fix: piles near a visible enemy are worth 50%, piles near a
+//      visible NPC 60%, so we stop paying full price to arrive second.
+//      (Latency itself was also trimmed: candidate lists instead of full
+//      grid scans, and order enumeration only when the units are close
+//      enough to interact.)
+//
+// Everything else carries over from v2: persistent obstacle/bomb/gold
+// memory, value-per-step chained targeting with off-and-back re-pickup,
+// dynamic k over [0,6] and both execution orders, second mover re-planning
+// around the first mover's claims. No STL, no allocation, no I/O.
 
 #include <cstring>
 
@@ -32,17 +40,20 @@
 namespace {
 
 constexpr int kCells = GRID_SIZE * GRID_SIZE;
-constexpr int kCenter = GRID_SIZE / 2;  // (8,8)
+constexpr int kCenter = GRID_SIZE / 2;   // (8,8)
+constexpr int kCenterLo = 4, kCenterHi = 12;  // the gold-rich central 9x9
 
 // row/col deltas indexed by ACT_UP, ACT_DOWN, ACT_LEFT, ACT_RIGHT.
 // dir^1 is the opposite direction (used for the off-and-back re-pickup).
 constexpr int kDr[4] = {-1, 1, 0, 0};
 constexpr int kDc[4] = {0, 0, -1, 1};
 
-constexpr int kGoldTTL = 40;        // rounds until a remembered pile is written off
+constexpr int kGoldTTLOuter = 40;   // slow linear decay outside the center
 constexpr int kBombTTL = 25;        // rounds a remembered bomb keeps blocking
+constexpr int kFogBaseCost = 20;    // centi-gold per fog step: hidden walls waste moves
 constexpr int kApproachCredit = 5;  // centi-gold/step for closing on a far pile
 constexpr int kCenterCredit = 2;    // centi-gold/step for drifting to the center
+constexpr int kMaxCand = 64;        // piles are sparse; more than this never happens
 
 // ---------------------------------------------------------------------------
 // Persistent state (survives across rounds; reset when a new match starts).
@@ -63,6 +74,10 @@ void ResetMatchState() {
 }
 
 bool InBounds(int r, int c) { return r >= 0 && r < GRID_SIZE && c >= 0 && c < GRID_SIZE; }
+
+bool InCenter(int r, int c) {
+    return r >= kCenterLo && r <= kCenterHi && c >= kCenterLo && c <= kCenterHi;
+}
 
 int Abs(int x) { return x < 0 ? -x : x; }
 
@@ -87,17 +102,23 @@ void UpdateMemory(const GameInput* in) {
     }
 }
 
-// How much gold we believe sits on (r,c): exact when visible, a decaying
-// memory when fogged (linear fade to ~35% credibility over kGoldTTL rounds).
+// How much gold we believe sits on (r,c): exact when visible; when fogged,
+// a memory decayed by how contested the ground is. The center is picked
+// clean within a few rounds by the opponent and 7 NPCs; the outer ring is
+// rarely visited, so memories there stay credible far longer.
 int BelievedGold(const GameInput* in, int r, int c) {
     const int v = in->grid[r][c];
     if (v >= 1) return v;
-    if (v == CELL_FOG && g_gold_amt[r][c] > 0) {
-        const int age = in->round - g_gold_round[r][c];
-        if (age > kGoldTTL) return 0;
-        return g_gold_amt[r][c] * (100 - (65 * age) / kGoldTTL) / 100;
+    if (v != CELL_FOG || g_gold_amt[r][c] <= 0) return 0;
+    const int age = in->round - g_gold_round[r][c];
+    if (InCenter(r, c)) {
+        if (age > 10) return 0;
+        int val = g_gold_amt[r][c];
+        for (int i = 0; i < age; ++i) val = val * 70 / 100;  // ~30%/round gone
+        return val;
     }
-    return 0;
+    if (age > kGoldTTLOuter) return 0;
+    return g_gold_amt[r][c] * (100 - (65 * age) / kGoldTTLOuter) / 100;
 }
 
 // ---------------------------------------------------------------------------
@@ -132,12 +153,28 @@ void RunBfs(const unsigned char blocked[GRID_SIZE][GRID_SIZE], int other_cell, i
     }
 }
 
-// Fog cells crossed on the way to `target` (excluding the target itself:
-// gold and bombs never share a cell, so the pile cell is safe to enter).
-int FogSteps(const GameInput* in, const Bfs& b, int start_idx, int target) {
+// Path from BFS start to `target`: forward-ordered step dirs and the cell
+// each step lands on. Returns length.
+int ExtractPath(const Bfs& b, int start_idx, int target, int dirs[], int cells[]) {
+    int len = 0;
+    for (int cur = target; cur != start_idx; cur = b.prev_cell[cur]) {
+        dirs[len] = b.prev_dir[cur];
+        cells[len] = cur;
+        ++len;
+    }
+    for (int i = 0; i < len / 2; ++i) {  // reverse into forward order
+        int t = dirs[i]; dirs[i] = dirs[len - 1 - i]; dirs[len - 1 - i] = t;
+        t = cells[i]; cells[i] = cells[len - 1 - i]; cells[len - 1 - i] = t;
+    }
+    return len;
+}
+
+// Fog cells a path crosses, excluding the target cell itself (gold and
+// bombs never share a cell, so a believed-pile cell is safe to enter).
+int FogSteps(const GameInput* in, const int cells[], int len) {
     int n = 0;
-    for (int cur = b.prev_cell[target]; cur != start_idx; cur = b.prev_cell[cur])
-        if (in->grid[cur / GRID_SIZE][cur % GRID_SIZE] == CELL_FOG) ++n;
+    for (int i = 0; i + 1 < len; ++i)
+        if (in->grid[cells[i] / GRID_SIZE][cells[i] % GRID_SIZE] == CELL_FOG) ++n;
     return n;
 }
 
@@ -163,14 +200,36 @@ void RunChain(const GameInput* in, Position start, int budget,
     out->npicks = 0;
     out->cum[0] = 0;
 
-    // What each cell is worth to this unit (piles the other unit reaches
-    // first are scaled down to their post-pickup remainder).
-    int value_left[kCells];
-    for (int r = 0; r < GRID_SIZE; ++r)
-        for (int c = 0; c < GRID_SIZE; ++c)
-            value_left[r * GRID_SIZE + c] = BelievedGold(in, r, c) * claim_pct[r][c] / 100;
+    // Sparse candidate list with contest-discounted values. Claims by the
+    // other unit scale a pile to its post-pickup remainder.
+    int cand[kMaxCand];
+    int cand_val[kCells];  // indexed by cell; zero everywhere but candidates
+    std::memset(cand_val, 0, sizeof(cand_val));
+    int ncand = 0;
+    for (int r = 0; r < GRID_SIZE && ncand < kMaxCand; ++r) {
+        for (int c = 0; c < GRID_SIZE && ncand < kMaxCand; ++c) {
+            int val = BelievedGold(in, r, c) * claim_pct[r][c] / 100;
+            if (val < 1) continue;
+            for (int e = 0; e < 2; ++e) {  // enemy nearby: we may arrive second
+                const Position p = in->visible_enemies[e];
+                if (p.row >= 0 && Abs(p.row - r) + Abs(p.col - c) <= 4) val = val * 50 / 100;
+            }
+            for (int i = 0; i < in->num_visible_npcs && i < MAX_NPCS; ++i) {
+                const Position p = in->visible_npcs[i].pos;
+                if (p.row >= 0 && Abs(p.row - r) + Abs(p.col - c) <= 2) {
+                    val = val * 60 / 100;
+                    break;  // one NPC discount is enough
+                }
+            }
+            if (val < 1) continue;
+            const int idx = r * GRID_SIZE + c;
+            cand[ncand++] = idx;
+            cand_val[idx] = val;
+        }
+    }
 
     static Bfs bfs;  // scratch; the engine calls us single-threaded
+    static int dirs[kCells], cells[kCells];
     int pos = start.row * GRID_SIZE + start.col;
     int remaining = budget;
     int value_now = 0;
@@ -178,24 +237,28 @@ void RunChain(const GameInput* in, Position start, int budget,
     while (remaining > 0) {
         RunBfs(blocked, other_cell, pos, &bfs);
 
-        // Best reachable pile by (fog-priced) pickup-per-step, best far
-        // pile to walk toward, and the re-pickup of the pile underfoot.
-        int best = -1, best_score = 0, best_dist = 0, best_gain = 0;
+        // Best reachable pile by fog-priced pickup-per-step, plus the best
+        // out-of-range pile to walk toward.
+        int best = -1, best_score = 0, best_gain = 0, best_dist = 0;
         int far = -1, far_score = 0;
-        for (int idx = 0; idx < kCells; ++idx) {
-            if (idx == pos || value_left[idx] < 1 || bfs.dist[idx] <= 0) continue;
-            const int pk = Ceil65(value_left[idx]);
+        for (int ci = 0; ci < ncand; ++ci) {
+            const int idx = cand[ci];
+            if (idx == pos || cand_val[idx] < 1 || bfs.dist[idx] <= 0) continue;
+            const int pk = Ceil65(cand_val[idx]);
             if (pk < 1) continue;
-            const int gain = pk * 100 - fog_cost_centi * FogSteps(in, bfs, pos, idx);
+            // Upper bound (zero fog penalty) prune before the path walk.
+            const int d = bfs.dist[idx];
+            if (pk * 100 / d <= (d <= remaining ? best_score : far_score)) continue;
+            const int len = ExtractPath(bfs, pos, idx, dirs, cells);
+            const int gain = pk * 100 - fog_cost_centi * FogSteps(in, cells, len);
             if (gain < 1) continue;
-            const int score = gain / bfs.dist[idx];
-            if (bfs.dist[idx] <= remaining) {
-                if (score > best_score ||
-                    (score == best_score && best >= 0 && bfs.dist[idx] < best_dist)) {
+            const int score = gain / len;
+            if (len <= remaining) {
+                if (score > best_score || (score == best_score && best >= 0 && len < best_dist)) {
                     best = idx;
                     best_score = score;
-                    best_dist = bfs.dist[idx];
                     best_gain = gain;
+                    best_dist = len;
                 }
             } else if (score > far_score) {
                 far = idx;
@@ -203,14 +266,17 @@ void RunChain(const GameInput* in, Position start, int budget,
             }
         }
 
-        // Re-entering the pile underfoot costs 2 moves for 65% of the rest.
-        const int here_pk = Ceil65(value_left[pos]);
+        // Re-entering the pile underfoot: 2 moves for 65% of the remainder.
+        // The step-off cell must be a KNOWN-safe neighbor — stepping off
+        // into fog could hit a hidden wall and desync the return move.
+        const int here_pk = Ceil65(cand_val[pos] >= 1 ? cand_val[pos] : 0);
         int osc_dir = -1;
         if (remaining >= 2 && here_pk >= 1 && here_pk * 100 / 2 > best_score) {
             const int r = pos / GRID_SIZE, c = pos % GRID_SIZE;
             for (int d = 0; d < 4; ++d) {
                 const int nr = r + kDr[d], nc = c + kDc[d];
-                if (InBounds(nr, nc) && !blocked[nr][nc] && nr * GRID_SIZE + nc != other_cell) {
+                if (InBounds(nr, nc) && !blocked[nr][nc] && in->grid[nr][nc] != CELL_FOG &&
+                    nr * GRID_SIZE + nc != other_cell) {
                     osc_dir = d;
                     break;
                 }
@@ -226,48 +292,63 @@ void RunChain(const GameInput* in, Position start, int budget,
             out->pick_cell[out->npicks] = pos;
             out->pick_step[out->npicks] = out->n;
             ++out->npicks;
-            value_left[pos] -= here_pk;
+            cand_val[pos] -= here_pk;
             remaining -= 2;
             continue;
         }
 
         if (best >= 0) {
-            // Walk to the pile; its value is credited on the arrival step.
-            int path[kCells];
-            int len = 0;
-            for (int cur = best; cur != pos; cur = bfs.prev_cell[cur]) path[len++] = bfs.prev_dir[cur];
-            for (int i = len - 1; i >= 0; --i) {
-                out->moves[out->n++] = path[i];
+            const int len = ExtractPath(bfs, pos, best, dirs, cells);
+            // Emit the path, but stop after the first step into fog (that
+            // step still executes — one unknown cell per round is the most
+            // we gamble; next round we re-plan with fresh vision there).
+            bool truncated = false;
+            int emitted = 0;
+            for (int i = 0; i < len; ++i) {
+                out->moves[out->n++] = dirs[i];
+                ++emitted;
+                const bool is_fog =
+                    in->grid[cells[i] / GRID_SIZE][cells[i] % GRID_SIZE] == CELL_FOG;
+                if (is_fog && cells[i] != best) {
+                    truncated = true;
+                    out->cum[out->n] = value_now;  // filled properly below
+                    break;
+                }
                 out->cum[out->n] = value_now;
+            }
+            if (truncated) {
+                // Progress credit only; the pickup didn't happen this round.
+                for (int i = out->n - emitted; i < out->n; ++i)
+                    out->cum[i + 1] = out->cum[i] + kApproachCredit;
+                value_now = out->cum[out->n];
+                break;
             }
             value_now += best_gain;
             out->cum[out->n] = value_now;
             out->pick_cell[out->npicks] = best;
             out->pick_step[out->npicks] = out->n;
             ++out->npicks;
-            value_left[best] -= Ceil65(value_left[best]);
+            cand_val[best] -= Ceil65(cand_val[best]);
             remaining -= len;
             pos = best;
             continue;
         }
 
         if (far >= 0) {
-            // Close the distance to the best out-of-range pile.
-            int path[kCells];
-            int len = 0;
-            for (int cur = far; cur != pos; cur = bfs.prev_cell[cur]) path[len++] = bfs.prev_dir[cur];
+            const int len = ExtractPath(bfs, pos, far, dirs, cells);
             const int take = remaining < len ? remaining : len;
             for (int i = 0; i < take; ++i) {
-                out->moves[out->n++] = path[len - 1 - i];
+                out->moves[out->n++] = dirs[i];
                 value_now += kApproachCredit;
                 out->cum[out->n] = value_now;
+                if (in->grid[cells[i] / GRID_SIZE][cells[i] % GRID_SIZE] == CELL_FOG)
+                    break;  // frontier reached: one unknown step, then stop
             }
-            remaining = 0;
             break;
         }
 
         // No gold anywhere in sight or memory: drift toward the center,
-        // where new gold spawns every round.
+        // where new gold spawns every round. Same one-fog-step discipline.
         int r = pos / GRID_SIZE, c = pos % GRID_SIZE;
         while (remaining > 0) {
             int best_dir = -1;
@@ -289,6 +370,7 @@ void RunChain(const GameInput* in, Position start, int budget,
             value_now += kCenterCredit;
             out->cum[out->n] = value_now;
             --remaining;
+            if (in->grid[r][c] == CELL_FOG) break;  // one unknown step max
         }
         break;
     }
@@ -332,8 +414,8 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
         if (InBounds(p.row, p.col)) ++npc_count[p.row][p.col];
     }
 
-    // Cells we refuse to plan through. Fog itself is passable now; known
-    // and remembered hazards still block.
+    // Cells we refuse to plan through. Fog itself is passable (but priced
+    // and rationed to one step per round); known/remembered hazards block.
     unsigned char blocked[GRID_SIZE][GRID_SIZE];
     for (int r = 0; r < GRID_SIZE; ++r) {
         for (int c = 0; c < GRID_SIZE; ++c) {
@@ -352,9 +434,11 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
 
     if (g_no_claims[0][0] != 100) std::memset(g_no_claims, 100, sizeof(g_no_claims));
 
-    // Expected bomb cost per fog step, per unit: ~2% bomb density x 10% of
-    // held gold => gold/5 centi-gold. Poor units explore, rich ones don't.
-    const int fog_cost[2] = {input->my_units_gold[0] / 5, input->my_units_gold[1] / 5};
+    // Fog price per step: a base charge (hidden obstacles waste moves even
+    // for a broke unit) plus the expected hidden-bomb cost (~2% density x
+    // 10% of held gold). Poor units explore; rich units keep to the map.
+    const int fog_cost[2] = {kFogBaseCost + input->my_units_gold[0] / 5,
+                             kFogBaseCost + input->my_units_gold[1] / 5};
 
     const int u_idx[2] = {input->my_units[0].row * GRID_SIZE + input->my_units[0].col,
                           input->my_units[1].row * GRID_SIZE + input->my_units[1].col};
@@ -365,11 +449,14 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
     RunChain(input, input->my_units[0], S, blocked, u_idx[1], g_no_claims, fog_cost[0], &base[0]);
     RunChain(input, input->my_units[1], S, blocked, u_idx[0], g_no_claims, fog_cost[1], &base[1]);
 
-    // Try both execution orders; for each, pick the split k maximizing the
-    // combined curves, then re-plan the second mover around the first
-    // mover's end cell and claimed piles. Keep whichever order realizes more.
+    // Execution order only matters when the units can actually interact
+    // this round; when they are far apart, skip the second enumeration.
+    const int unit_gap = Abs(input->my_units[0].row - input->my_units[1].row) +
+                         Abs(input->my_units[0].col - input->my_units[1].col);
+    const int num_orders = unit_gap > 2 * S ? 1 : 2;
+
     int best_total = -1, best_k = S / 2, best_order = 0;
-    for (int ord = 0; ord < 2; ++ord) {
+    for (int ord = 0; ord < num_orders; ++ord) {
         const int f = ord;      // unit index moving first
         const int s = 1 - ord;  // unit index moving second
         int k_pick = S / 2, k_total = -1;
