@@ -55,17 +55,42 @@ constexpr int kApproachCredit = 5;  // centi-gold/step for closing on a far pile
 constexpr int kCenterCredit = 2;    // centi-gold/step for drifting to the center
 constexpr int kMaxCand = 64;        // piles are sparse; more than this never happens
 
+// Wealth threshold for fog behavior, tuned in the local simulator: a unit
+// holding less than this explores fog freely (a hidden bomb can only take
+// ~10% of pocket change, and forced 50/50-order experiments showed the
+// aggressive explorer out-collecting the timid bot); a richer unit rations
+// itself to one heavily-priced fog step per round to protect its stack.
+constexpr int kExploreCap = 30;
+
 // ---------------------------------------------------------------------------
 // Persistent state (survives across rounds; reset when a new match starts).
 // ---------------------------------------------------------------------------
 int g_last_round = -1;
 unsigned char g_obstacle[GRID_SIZE][GRID_SIZE];  // ever seen an obstacle here
+
+// Seat inference. The engine executes the faster bot's moves first, then
+// the NPCs, then the slower bot — and forced-order simulator experiments
+// showed the two seats want opposite strategies (first: aggressive, long
+// memory, contest everything -> ~1786 net; second: cautious, fast decay,
+// concede contests -> the aggressive profile collapses to ~356). The seat
+// is not in the API, but it is observable: when we move first, the piles
+// we planned to grab are still there; when we move second, they keep
+// vanishing before we arrive. Track planned-vs-realized pickups and flip
+// profiles when the shortfall becomes systematic.
+bool g_second_seat = false;
+int g_seat_ema = 0;        // 0..100, exponential average of shortfall rounds
+int g_prev_gold_sum = -1;  // our total gold after last round's plan
+int g_planned_gain = 0;    // visible-pile pickups last plan promised
 int g_bomb_round[GRID_SIZE][GRID_SIZE];          // last round a bomb was seen here
 int g_gold_amt[GRID_SIZE][GRID_SIZE];            // last seen pile size
 int g_gold_round[GRID_SIZE][GRID_SIZE];          // round of that sighting
 
 void ResetMatchState() {
     g_last_round = -1;
+    g_second_seat = false;
+    g_seat_ema = 0;
+    g_prev_gold_sum = -1;
+    g_planned_gain = 0;
     std::memset(g_obstacle, 0, sizeof(g_obstacle));
     std::memset(g_gold_amt, 0, sizeof(g_gold_amt));
     std::memset(g_gold_round, 0, sizeof(g_gold_round));
@@ -111,10 +136,12 @@ int BelievedGold(const GameInput* in, int r, int c) {
     if (v >= 1) return v;
     if (v != CELL_FOG || g_gold_amt[r][c] <= 0) return 0;
     const int age = in->round - g_gold_round[r][c];
-    if (InCenter(r, c)) {
+    if (g_second_seat && InCenter(r, c)) {
+        // Second seat: the opponent and NPCs sweep the center before we
+        // ever move, so center memories rot ~30% per round.
         if (age > 10) return 0;
         int val = g_gold_amt[r][c];
-        for (int i = 0; i < age; ++i) val = val * 70 / 100;  // ~30%/round gone
+        for (int i = 0; i < age; ++i) val = val * 70 / 100;
         return val;
     }
     if (age > kGoldTTLOuter) return 0;
@@ -195,7 +222,7 @@ struct Chain {
 void RunChain(const GameInput* in, Position start, int budget,
               const unsigned char blocked[GRID_SIZE][GRID_SIZE], int other_cell,
               const unsigned char claim_pct[GRID_SIZE][GRID_SIZE], int fog_cost_centi,
-              Chain* out) {
+              bool full_emit, Chain* out) {
     out->n = 0;
     out->npicks = 0;
     out->cum[0] = 0;
@@ -210,15 +237,17 @@ void RunChain(const GameInput* in, Position start, int budget,
         for (int c = 0; c < GRID_SIZE && ncand < kMaxCand; ++c) {
             int val = BelievedGold(in, r, c) * claim_pct[r][c] / 100;
             if (val < 1) continue;
-            for (int e = 0; e < 2; ++e) {  // enemy nearby: we may arrive second
-                const Position p = in->visible_enemies[e];
-                if (p.row >= 0 && Abs(p.row - r) + Abs(p.col - c) <= 4) val = val * 50 / 100;
-            }
-            for (int i = 0; i < in->num_visible_npcs && i < MAX_NPCS; ++i) {
-                const Position p = in->visible_npcs[i].pos;
-                if (p.row >= 0 && Abs(p.row - r) + Abs(p.col - c) <= 2) {
-                    val = val * 60 / 100;
-                    break;  // one NPC discount is enough
+            if (g_second_seat) {  // moving last: contested piles get swept
+                for (int e = 0; e < 2; ++e) {
+                    const Position p = in->visible_enemies[e];
+                    if (p.row >= 0 && Abs(p.row - r) + Abs(p.col - c) <= 4) val = val * 50 / 100;
+                }
+                for (int i = 0; i < in->num_visible_npcs && i < MAX_NPCS; ++i) {
+                    const Position p = in->visible_npcs[i].pos;
+                    if (p.row >= 0 && Abs(p.row - r) + Abs(p.col - c) <= 2) {
+                        val = val * 60 / 100;
+                        break;
+                    }
                 }
             }
             if (val < 1) continue;
@@ -309,7 +338,7 @@ void RunChain(const GameInput* in, Position start, int budget,
                 ++emitted;
                 const bool is_fog =
                     in->grid[cells[i] / GRID_SIZE][cells[i] % GRID_SIZE] == CELL_FOG;
-                if (is_fog && cells[i] != best) {
+                if (!full_emit && is_fog && cells[i] != best) {
                     truncated = true;
                     out->cum[out->n] = value_now;  // filled properly below
                     break;
@@ -341,7 +370,8 @@ void RunChain(const GameInput* in, Position start, int budget,
                 out->moves[out->n++] = dirs[i];
                 value_now += kApproachCredit;
                 out->cum[out->n] = value_now;
-                if (in->grid[cells[i] / GRID_SIZE][cells[i] % GRID_SIZE] == CELL_FOG)
+                if (!full_emit &&
+                    in->grid[cells[i] / GRID_SIZE][cells[i] % GRID_SIZE] == CELL_FOG)
                     break;  // frontier reached: one unknown step, then stop
             }
             break;
@@ -370,7 +400,7 @@ void RunChain(const GameInput* in, Position start, int budget,
             value_now += kCenterCredit;
             out->cum[out->n] = value_now;
             --remaining;
-            if (in->grid[r][c] == CELL_FOG) break;  // one unknown step max
+            if (!full_emit && in->grid[r][c] == CELL_FOG) break;  // one unknown step max
         }
         break;
     }
@@ -404,6 +434,14 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
     if (input->round == 0 || input->round <= g_last_round) ResetMatchState();
     g_last_round = input->round;
 
+    // Seat inference: did last round's promised visible pickups arrive?
+    const int gold_sum = input->my_units_gold[0] + input->my_units_gold[1];
+    if (g_prev_gold_sum >= 0 && g_planned_gain > 0) {
+        const int realized = gold_sum - g_prev_gold_sum;
+        g_seat_ema = (7 * g_seat_ema + (realized < g_planned_gain ? 100 : 0)) / 8;
+        g_second_seat = g_seat_ema >= 35;
+    }
+
     UpdateMemory(input);
 
     // Trampling: >= 3 NPCs on one cell costs 5% of held gold on entry.
@@ -434,11 +472,25 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
 
     if (g_no_claims[0][0] != 100) std::memset(g_no_claims, 100, sizeof(g_no_claims));
 
-    // Fog price per step: a base charge (hidden obstacles waste moves even
-    // for a broke unit) plus the expected hidden-bomb cost (~2% density x
-    // 10% of held gold). Poor units explore; rich units keep to the map.
-    const int fog_cost[2] = {kFogBaseCost + input->my_units_gold[0] / 5,
-                             kFogBaseCost + input->my_units_gold[1] / 5};
+    // Fog policy per unit, by seat profile. First seat: explore freely at
+    // a small wealth-scaled price — our information is fresh because we
+    // move before everyone, and forced-order experiments showed aggression
+    // out-earning caution by ~50% in this seat. Second seat: poor units
+    // still explore, but a rich unit pays ~1% of held gold per fog step
+    // (bomb waves accumulate in unexplored ground) and is rationed to one
+    // fog step per round by path truncation.
+    bool explore[2];
+    int fog_cost[2];
+    for (int u = 0; u < 2; ++u) {
+        const int g = input->my_units_gold[u];
+        if (!g_second_seat) {
+            explore[u] = true;
+            fog_cost[u] = g / 5;
+        } else {
+            explore[u] = g < kExploreCap;
+            fog_cost[u] = explore[u] ? kFogBaseCost + g / 5 : kFogBaseCost + g;
+        }
+    }
 
     const int u_idx[2] = {input->my_units[0].row * GRID_SIZE + input->my_units[0].col,
                           input->my_units[1].row * GRID_SIZE + input->my_units[1].col};
@@ -446,8 +498,10 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
     // Full-budget chains for both units, each with the other parked on its
     // current cell. Exact for whoever moves first; provisional otherwise.
     static Chain base[2], replan[2];
-    RunChain(input, input->my_units[0], S, blocked, u_idx[1], g_no_claims, fog_cost[0], &base[0]);
-    RunChain(input, input->my_units[1], S, blocked, u_idx[0], g_no_claims, fog_cost[1], &base[1]);
+    RunChain(input, input->my_units[0], S, blocked, u_idx[1], g_no_claims, fog_cost[0],
+             explore[0], &base[0]);
+    RunChain(input, input->my_units[1], S, blocked, u_idx[0], g_no_claims, fog_cost[1],
+             explore[1], &base[1]);
 
     // Execution order only matters when the units can actually interact
     // this round; when they are far apart, skip the second enumeration.
@@ -478,7 +532,7 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
             claims[r][c] = static_cast<unsigned char>(claims[r][c] * 35 / 100);
         }
         RunChain(input, input->my_units[s], S - fb, blocked,
-                 f_end.row * GRID_SIZE + f_end.col, claims, fog_cost[s], &replan[s]);
+                 f_end.row * GRID_SIZE + f_end.col, claims, fog_cost[s], explore[s], &replan[s]);
 
         const int realized = base[f].cum[fb] + replan[s].cum[S - fb];
         if (realized > best_total) {
@@ -496,5 +550,22 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
     const Chain& plan1 = (best_order == 0) ? replan[1] : base[1];
     for (int i = 0; i < best_k && i < plan0.n; ++i) out.actions[i] = plan0.moves[i];
     for (int i = 0; i < S - best_k && i < plan1.n; ++i) out.actions[best_k + i] = plan1.moves[i];
+
+    // Remember what this plan promises so next round can audit the seat:
+    // each unit's first pickup that targets a currently VISIBLE pile.
+    g_planned_gain = 0;
+    const Chain* plans[2] = {&plan0, &plan1};
+    const int budgets[2] = {best_k, S - best_k};
+    for (int u = 0; u < 2; ++u) {
+        for (int i = 0; i < plans[u]->npicks && plans[u]->pick_step[i] <= budgets[u]; ++i) {
+            const int r = plans[u]->pick_cell[i] / GRID_SIZE;
+            const int c = plans[u]->pick_cell[i] % GRID_SIZE;
+            if (input->grid[r][c] >= 1) {
+                g_planned_gain += Ceil65(input->grid[r][c]);
+                break;
+            }
+        }
+    }
+    g_prev_gold_sum = gold_sum;
     return out;
 }

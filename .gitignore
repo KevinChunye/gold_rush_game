@@ -7,3 +7,5 @@ test_runner
 .DS_Store
 .vscode/
 .idea/
+ml/__pycache__/
+sim/simulator

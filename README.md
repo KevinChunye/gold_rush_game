@@ -40,7 +40,19 @@ So the game is essentially **exploration vs. exploitation under fog of war
 with a latency scoreboard**: find gold you cannot fully see, route two units
 efficiently around hazards, and answer quickly.
 
-## 2. What the bot does (v2 — "memory + value chains")
+## 2. What the bot does (v2.4 — "memory + value chains, seat-adaptive")
+
+**v2.4 headline:** the engine executes the *faster-answering* bot's moves
+first each round, then the NPCs, then the slower bot — and simulator
+experiments showed the two seats want opposite strategies (details in §6).
+The seat isn't in the API, but it's observable: when we move first, piles
+we planned to grab are still there; when we move second they keep
+vanishing. The bot audits planned-vs-realized pickups each round and
+switches profile: **first seat** = aggressive (free-roaming exploration,
+long gold memory, contest everything); **second seat** = defensive
+(fog rationed to one priced step per round, fast center-memory decay,
+contested piles discounted). Everything below describes the shared
+machinery.
 
 Everything lives in [`src/player.cpp`](src/player.cpp) (~380 lines, no STL,
 no allocation, no I/O). The decision architecture is expected-value
@@ -84,9 +96,13 @@ maximization over the 6 moves, not nearest-gold greed:
 │   └── local_test.cpp    offline harness: dlopen()s player.so like the real
 │                         engine, runs scripted scenarios, checks legality,
 │                         measures p50/p90 latency
-└── reference/            official 参考代码 from the organizers (game.zip):
-                          canonical game_api.h, a random-walk sample player
-                          (C++ and Python), their Makefile
+├── reference/            official 参考代码 from the organizers (game.zip):
+│                         canonical game_api.h, a random-walk sample player
+│                         (C++ and Python), their Makefile
+├── sim/                  local match engine: dlopen()s two bot .so files,
+│                         plays full 500-round rule-faithful matches (§6)
+├── ml/                   kev03 neural-cartographer scaffold (§7)
+└── docs/KEV03.md         kev03 design doc, phase plan, review backlog
 ```
 
 ## 4. Quick start
@@ -155,10 +171,57 @@ extern "C" GameOutput moveDecision(const GameInput* input);
   the pre-move state, and only the final position's vision comes back next
   round (no en-route vision).
 
-## 6. Status → roadmap
+## 6. Local simulator (`sim/`)
 
-Done in v2: value/distance targeting, gold + bomb memory with decay,
-re-pickup chains, dynamic `k` + `order`, wealth-priced fog crossing.
+A rules-faithful headless engine that `dlopen`s two real submission `.so`
+files (isolated copies, so both can export `moveDecision` and keep private
+global state) and plays full 500-round matches: decision-time move
+ordering at nanosecond precision like the real engine, fog/vision/vp,
+pickups, bombs, trampling, NPCs, snapshots, mirrored maps. Spawn rates,
+NPC policy, bomb waves and region geometry are **guesses** collected in
+`SimConfig`, to be calibrated from official logs.
+
+```bash
+make -C sim
+sim/simulator botA.so botB.so --games 10 --seed 42 --mirror \
+    [--quantum-ns 1000000000]   # neutralize latency ordering
+    [--force-first A|B]         # pin the first-moving bot
+```
+
+Key findings from the v1/v2.x experiments (mean net gold, 20 mirrored
+plays, identical seeds):
+
+| bot | as first mover | as second (vs v1) | order neutralized |
+|---|---|---|---|
+| v1 (nearest-visible BFS) | 1184–1252 | 324–364 | 770–779 |
+| v2.0 (aggressive memory) | 1786 | 356 | 1032 |
+| v2.2 (cautious memory) | 1428 | 403 | 906 |
+| **v2.4 (seat-adaptive)** | **1863** | **415** | — |
+
+Interpretation: in a mirror matchup, first-mover status dominates
+strategy (the second mover collects scraps regardless); the first seat
+rewards aggression, the second rewards caution — hence v2.4's adaptive
+switch. The kev02-vs-kev01 ladder blowout (431 vs 1195) is reproduced
+almost exactly by the sim at nanosecond ordering (356 vs 1252), which is
+what validated this analysis.
+
+## 7. ML track (`ml/`, `docs/KEV03.md`)
+
+Scaffold for the "neural cartographer" third-family submission: a
+ConvGRU spatial belief map with auxiliary mapping losses and
+snapshot-consistency weak supervision, unit-token cross-attention, an
+autoregressive joint action head, and a privileged critic — plus a
+dependency-free C++ inference skeleton (`ml/csrc/`) for embedding the
+trained policy in the contest `.so`. Training is **blocked on the
+official logs** (`/share/data.tar.gz` + per-match downloads) for
+simulator calibration; see `docs/KEV03.md` for the phase plan,
+deployment latency budget, and open review findings.
+
+## 8. Status → roadmap
+
+Done: value/distance targeting, gold + bomb memory with decay, re-pickup
+chains, dynamic `k` + `order`, priced fog crossing, seat inference with
+adaptive profiles, a rules-faithful local simulator, ML-track scaffold.
 
 Next, in rough order of expected value:
 
