@@ -11,12 +11,12 @@
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
 
-# -static-libstdc++/-static-libgcc: the engine dlopen()s our library into
-# its own process, so we avoid depending on whatever libstdc++ it ships.
-# (The official sample uses `-O2 -march=native -fPIC -shared`; -march=native
-# is fine when compiling on the contest server, whose CPU matches the judge
-# machines, but we skip it so the .so also runs when built elsewhere.)
-SOFLAGS = -shared -fPIC -static-libstdc++ -static-libgcc
+# Link line matches the official sample (minus -march=native, which is fine
+# on the contest server but risky for a .so built elsewhere). Do NOT add
+# -static-libstdc++: the contest dev server has no static libstdc++.a
+# installed, so that flag fails to link there. The bot uses no libstdc++
+# features anyway, so the shared build carries no real runtime dependency.
+SOFLAGS = -shared -fPIC
 
 player.so: src/player.cpp src/game_api.h src/constants.h
 	$(CXX) $(CXXFLAGS) $(SOFLAGS) -o $@ src/player.cpp
