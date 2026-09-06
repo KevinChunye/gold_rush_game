@@ -1,0 +1,9 @@
+# build artifacts (rebuild with `make`)
+*.so
+*.o
+test_runner
+
+# editor / OS noise
+.DS_Store
+.vscode/
+.idea/
