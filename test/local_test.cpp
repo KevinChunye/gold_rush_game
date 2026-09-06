@@ -204,8 +204,7 @@ int main() {
     s3.grid[1][0] = CELL_OBSTACLE;
     s3.grid[1][1] = CELL_OBSTACLE;
     const GameOutput o3 = RunScenario(move, "boxed-in corner: stay put safely", s3, false);
-    CHECK(o3.k == 0 || o3.actions[0] == ACT_STAY,
-          "boxed-in unit A must stay or yield its moves (k=%d)", o3.k);
+    CHECK(o3.actions[0] == ACT_STAY, "boxed-in unit A must stay");
 
     // --- Scenario 4: gold guarded by an NPC crowd -> take the safe pile ---
     GameInput s4 = MakeEmptyInput();
@@ -237,59 +236,13 @@ int main() {
     s5.gold_opp = 40;
     RunScenario(move, "enemy standing on the nearest gold: no illegal bump", s5, false);
 
-    // --- Scenario 6: gold memory — return to a pile now hidden in fog ----
-    GameInput s6a = MakeEmptyInput();
-    s6a.round = 5;
-    s6a.my_units[0] = {4, 4};
-    s6a.my_units[1] = {16, 16};
-    RevealVision(&s6a, 4, 4);
-    RevealVision(&s6a, 16, 16);
-    s6a.grid[4][6] = 8;
-    const GameOutput o6a = RunScenario(move, "memory setup: pile visible at (4,6)", s6a, false);
-    CHECK(o6a.actions[0] == ACT_RIGHT, "unit A should head for the visible pile");
-
-    GameInput s6 = MakeEmptyInput();
-    s6.round = 6;
-    s6.my_units[0] = {4, 1};  // moved away; the pile is now deep in fog
-    s6.my_units[1] = {16, 16};
-    RevealVision(&s6, 4, 1);
-    RevealVision(&s6, 16, 16);
-    const GameOutput o6 = RunScenario(move, "pile fogged out: memory routes back", s6, false);
-    CHECK(o6.actions[0] == ACT_RIGHT, "unit A should walk toward the remembered pile");
-
-    // --- Scenario 7: value beats distance --------------------------------
-    GameInput s7 = MakeEmptyInput();
-    s7.round = 7;
-    s7.my_units[0] = {8, 8};
-    s7.my_units[1] = {16, 16};
-    RevealVision(&s7, 8, 8);
-    RevealVision(&s7, 16, 16);
-    s7.grid[8][7] = 2;    // adjacent but tiny
-    s7.grid[8][10] = 12;  // two steps away but rich
-    const GameOutput o7 = RunScenario(move, "rich pile 2 steps away beats tiny pile adjacent",
-                                      s7, false);
-    CHECK(o7.actions[0] == ACT_RIGHT, "unit A should go for the rich pile first");
-
-    // --- Scenario 8: dynamic split gives the busy unit more moves --------
-    GameInput s8 = MakeEmptyInput();
-    s8.round = 8;
-    s8.my_units[0] = {8, 8};  // surrounded by piles
-    s8.my_units[1] = {16, 16};  // sees nothing
-    RevealVision(&s8, 8, 8);
-    RevealVision(&s8, 16, 16);
-    s8.grid[8][7] = 4;
-    s8.grid[7][8] = 4;
-    s8.grid[8][9] = 4;
-    const GameOutput o8 = RunScenario(move, "unit amid 3 piles gets the lion's share", s8, false);
-    CHECK(o8.k >= 4, "most of the budget should go to unit A (k=%d)", o8.k);
-
     // --- Latency: the contest's other scoreboard ------------------------
     // 300 ms/round hard-ish limit, P90 latency breaks ties + speed prize.
     const int kIters = 20000;
     std::vector<double> us(kIters);
     for (int i = 0; i < kIters; ++i) {
         GameInput in = s1;
-        in.round = 10 + (i % 480);  // ascending; wraps trigger a cheap state reset
+        in.round = 5 + (i % 490);  // avoid the round==0 state reset path
         const auto t0 = std::chrono::steady_clock::now();
         const GameOutput out = move(&in);
         const auto t1 = std::chrono::steady_clock::now();

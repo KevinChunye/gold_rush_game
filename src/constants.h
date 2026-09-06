@@ -1,13 +1,10 @@
-// constants.h — rule constants shared by the bot and the local tests.
-//
-// Kept out of game_api.h so that src/game_api.h stays byte-identical to
-// the official reference/game_api.h (run `diff` on the pair any time the
-// organizers ship an update — they must never drift apart).
+// constants.h — grid cell values and action codes from the competition
+// rules, shared by the bot and the offline test harness.
 #pragma once
 
 #include "game_api.h"
 
-// grid[][] cell values (the official header documents these only in a comment)
+// grid[][] cell values
 constexpr int CELL_FOG = -5;       // outside our vision
 constexpr int CELL_BOMB = -3;      // entering costs 10% of held gold
 constexpr int CELL_OBSTACLE = -1;  // impassable

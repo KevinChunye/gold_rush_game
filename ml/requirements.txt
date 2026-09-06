@@ -1,5 +1,0 @@
-# kev03 (neural belief-map agent) — training-side dependencies.
-# The DEPLOYED artifact is a dependency-free C++ .so (see ml/csrc/); none of
-# this ships to the judge machine.
-torch>=2.1
-numpy>=1.24
